@@ -20,91 +20,166 @@ import SholawatView from './components/SholawatView.tsx';
 import QiblaView from './components/QiblaView.tsx';
 import ReadingPracticeView from './components/ReadingPracticeView.tsx';
 import QuizView from './components/QuizView.tsx';
+import AuthView from './components/AuthView.tsx';
 import LoadingIndicator from './components/LoadingIndicator.tsx';
 import { analyzeKitabText } from './services/geminiService.ts';
+import * as supabaseService from './services/supabaseService.ts';
 import { TranslationResult, AppSettings, HistoryItem } from './types.ts';
-import { AlertTriangle, AlertOctagon, Settings } from 'lucide-react';
+import { AlertTriangle, AlertOctagon } from 'lucide-react';
 import { StatusBar, Style } from '@capacitor/status-bar';
 import { App as CapacitorApp } from '@capacitor/app';
+import { Session } from '@supabase/supabase-js';
 
-type ViewState = 'HOME' | 'RESULT' | 'BOOK_DETAIL' | 'AUTHOR_DETAIL' | 'LIBRARY_VIEW' | 'QURAN' | 'HADITH' | 'SETTINGS' | 'INHERITANCE' | 'ZAKAT' | 'TASBIH' | 'CALENDAR' | 'DOA' | 'SHOLAWAT' | 'QIBLA' | 'READING_PRACTICE' | 'QUIZ';
+type ViewState = 'HOME' | 'RESULT' | 'BOOK_DETAIL' | 'AUTHOR_DETAIL' | 'LIBRARY_VIEW' | 'QURAN' | 'HADITH' | 'SETTINGS' | 'INHERITANCE' | 'ZAKAT' | 'TASBIH' | 'CALENDAR' | 'DOA' | 'SHOLAWAT' | 'QIBLA' | 'READING_PRACTICE' | 'QUIZ' | 'AUTH';
 
-// 1. Create & Export App Context for global state
 export const AppContext = createContext<any>(null);
 
 const AppProvider: React.FC<{children: React.ReactNode}> = ({ children }) => {
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
-      const savedSettings = localStorage.getItem('appSettings');
-      return savedSettings ? JSON.parse(savedSettings) : { arabicFont: 'scheherazade', latinFont: 'sans', textSize: 'medium', darkMode: false };
-    } catch (e) { return { arabicFont: 'scheherazade', latinFont: 'sans', textSize: 'medium', darkMode: false }; }
+      const saved = localStorage.getItem('appSettings');
+      return saved ? JSON.parse(saved) : { arabicFont: 'scheherazade', latinFont: 'sans', textSize: 'medium', darkMode: false };
+    } catch { return { arabicFont: 'scheherazade', latinFont: 'sans', textSize: 'medium', darkMode: false }; }
   });
 
-  const [history, setHistory] = useState<HistoryItem[]>(() => {
-    try { return JSON.parse(localStorage.getItem('kitabHistory') || '[]'); } 
-    catch (e) { return []; }
-  });
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
-  const isMounted = useRef(false);
-
+  // Load initial session and subscribe to auth changes
   useEffect(() => {
-    try { localStorage.setItem('appSettings', JSON.stringify(settings)); } catch (e) { console.warn("Gagal menyimpan settings"); }
+    setAuthLoading(true);
+    supabaseService.getSession().then(s => {
+      setSession(s);
+      setAuthLoading(false);
+    });
+    const authSubscription = supabaseService.onAuthStateChange(setSession);
+    return () => authSubscription.unsubscribe();
+  }, []);
+
+  // Fetch data based on session
+  useEffect(() => {
+    const loadData = async () => {
+      if (session) {
+        // User is logged in, fetch from Supabase
+        const cloudHistory = await supabaseService.getHistory();
+        setHistory(cloudHistory);
+      } else if (!authLoading) {
+        // User is logged out, load from local storage
+        try {
+          const localHistory = JSON.parse(localStorage.getItem('kitabHistory') || '[]');
+          setHistory(localHistory);
+        } catch { setHistory([]); }
+      }
+    };
+    loadData();
+  }, [session, authLoading]);
+  
+  // Migrate local data to cloud on first login
+  useEffect(() => {
+    if (session) {
+      const hasMigrated = localStorage.getItem('hasMigratedToCloud');
+      if (!hasMigrated) {
+        try {
+          const localHistory = JSON.parse(localStorage.getItem('kitabHistory') || '[]');
+          if (localHistory.length > 0) {
+            console.log("Migrating local history to cloud...");
+            Promise.all(localHistory.map((item: any) => supabaseService.addHistoryItem({
+              arabicPreview: item.arabicPreview,
+              translationPreview: item.translationPreview,
+              fullResult: item.fullResult,
+            }))).then(() => {
+              console.log("Migration complete.");
+              localStorage.setItem('hasMigratedToCloud', 'true');
+            });
+          } else {
+             localStorage.setItem('hasMigratedToCloud', 'true');
+          }
+        } catch {}
+      }
+    }
+  }, [session]);
+
+
+  // Save settings to local storage
+  useEffect(() => {
+    localStorage.setItem('appSettings', JSON.stringify(settings));
     document.documentElement.classList.toggle('dark', settings.darkMode);
   }, [settings]);
 
-  useEffect(() => {
-    if (isMounted.current) {
-      try { localStorage.setItem('kitabHistory', JSON.stringify(history)); } catch (e) { console.warn("Gagal menyimpan history"); }
-    } else { isMounted.current = true; }
-  }, [history]);
-
-  const addToHistory = (data: TranslationResult) => {
-    const newItem: HistoryItem = {
-      id: Date.now().toString(),
-      timestamp: Date.now(),
+  // --- Data Management Functions ---
+  const addToHistory = async (data: TranslationResult) => {
+    const newItem: Omit<HistoryItem, 'id' | 'timestamp'> = {
       arabicPreview: data.arabicText.substring(0, 50) + (data.arabicText.length > 50 ? '...' : ''),
       translationPreview: data.translationIndonesia.substring(0, 80) + (data.translationIndonesia.length > 80 ? '...' : ''),
       fullResult: data
     };
-    setHistory((prev: HistoryItem[]) => [newItem, ...prev].slice(0, 20));
+    if (session) {
+      await supabaseService.addHistoryItem(newItem);
+      const updatedHistory = await supabaseService.getHistory();
+      setHistory(updatedHistory);
+    } else {
+      setHistory(prev => {
+        const newHistory = [{ ...newItem, id: Date.now().toString(), timestamp: Date.now() }, ...prev].slice(0, 20);
+        localStorage.setItem('kitabHistory', JSON.stringify(newHistory));
+        return newHistory;
+      });
+    }
+  };
+
+  const deleteHistoryItem = async (id: string) => {
+    if (session) {
+      await supabaseService.deleteHistoryItem(id);
+      setHistory(prev => prev.filter(item => item.id !== id));
+    } else {
+      setHistory(prev => {
+        const newHistory = prev.filter(item => item.id !== id);
+        localStorage.setItem('kitabHistory', JSON.stringify(newHistory));
+        return newHistory;
+      });
+    }
+  };
+
+  const clearAllHistory = async () => {
+    if (confirm('Hapus semua riwayat?')) {
+      if (session) {
+        await supabaseService.clearHistory();
+      } else {
+        localStorage.setItem('kitabHistory', '[]');
+      }
+      setHistory([]);
+    }
   };
   
   const value = {
     settings,
     setSettings,
     history,
-    setHistory,
-    addToHistory
+    addToHistory,
+    deleteHistoryItem,
+    clearAllHistory,
+    session,
+    authLoading,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 };
 
-// --- HASH ROUTING LOGIC ---
 const getViewFromHash = (): { view: ViewState, params: Record<string, string> } => {
   const hash = window.location.hash.slice(1);
   if (!hash) return { view: 'HOME', params: {} };
   
   const [path, query] = hash.split('?');
   const params: Record<string, string> = {};
-  if (query) {
-    new URLSearchParams(query).forEach((value, key) => {
-      params[key] = decodeURIComponent(value);
-    });
-  }
+  if (query) new URLSearchParams(query).forEach((v,k) => { params[k] = decodeURIComponent(v); });
   
   const view = path.toUpperCase() as ViewState;
+  const validViews: ViewState[] = ['HOME','RESULT','BOOK_DETAIL','AUTHOR_DETAIL','LIBRARY_VIEW','QURAN','HADITH','SETTINGS','INHERITANCE','ZAKAT','TASBIH','CALENDAR','DOA','SHOLAWAT','QIBLA','READING_PRACTICE','QUIZ', 'AUTH'];
   
-  const validViews: ViewState[] = ['HOME', 'RESULT', 'BOOK_DETAIL', 'AUTHOR_DETAIL', 'LIBRARY_VIEW', 'QURAN', 'HADITH', 'SETTINGS', 'INHERITANCE', 'ZAKAT', 'TASBIH', 'CALENDAR', 'DOA', 'SHOLAWAT', 'QIBLA', 'READING_PRACTICE', 'QUIZ'];
-  
-  if (validViews.includes(view)) {
-    return { view, params };
-  }
-  
-  return { view: 'HOME', params: {} };
+  return validViews.includes(view) ? { view, params } : { view: 'HOME', params: {} };
 };
 
-const navigate = (view: ViewState, params?: Record<string, string>) => {
+export const navigate = (view: ViewState, params?: Record<string, string>) => {
   let hash = `#${view.toLowerCase()}`;
   if (params) {
     const searchParams = new URLSearchParams();
@@ -114,27 +189,26 @@ const navigate = (view: ViewState, params?: Record<string, string>) => {
   window.location.hash = hash;
 };
 
-// --- MAIN APP COMPONENT ---
 const AppCore: React.FC = () => {
-  const { settings, history, setHistory, addToHistory } = useContext(AppContext);
+  const { settings, history, addToHistory, deleteHistoryItem, clearAllHistory, session } = useContext(AppContext);
   
   const [route, setRoute] = useState(getViewFromHash());
   const currentView = route.view;
 
-  // Analysis State
   const [result, setResult] = useState<TranslationResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [initialInputText, setInitialInputText] = useState<string>('');
 
-  // Sidebar States
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [isBookmarkOpen, setIsBookmarkOpen] = useState(false);
   const [isHadithBookmarkOpen, setIsHadithBookmarkOpen] = useState(false);
 
-  // Scripture Jump States
   const [bookmarkTarget, setBookmarkTarget] = useState<{surah: number, ayah: number} | null>(null);
   const [hadithBookmarkTarget, setHadithBookmarkTarget] = useState<{bookId: string, hadithNumber: number} | null>(null);
+  
+  // Public Cache State
+  const [publicAnalyses, setPublicAnalyses] = useState<any[]>([]);
 
   useEffect(() => {
     const handleHashChange = () => setRoute(getViewFromHash());
@@ -143,34 +217,31 @@ const AppCore: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const configureStatusBar = async () => {
-      if (typeof (window as any).Capacitor !== 'undefined' && (window as any).Capacitor.isPluginAvailable('StatusBar')) {
-        try {
-          await StatusBar.setOverlaysWebView({ overlay: true });
-          await StatusBar.setStyle({ style: settings.darkMode ? Style.Dark : Style.Light });
-          await StatusBar.setBackgroundColor({ color: '#00000000' });
-        } catch (e) { console.error("Status bar config failed", e); }
-      }
-    };
-    configureStatusBar();
+    if (typeof (window as any).Capacitor !== 'undefined' && (window as any).Capacitor.isPluginAvailable('StatusBar')) {
+      StatusBar.setOverlaysWebView({ overlay: true }).catch(console.error);
+    }
+  }, []);
+
+  useEffect(() => {
+     if (typeof (window as any).Capacitor !== 'undefined' && (window as any).Capacitor.isPluginAvailable('StatusBar')) {
+        StatusBar.setStyle({ style: settings.darkMode ? Style.Dark : Style.Light }).catch(console.error);
+     }
   }, [settings.darkMode]);
 
   useEffect(() => {
-    if (typeof (window as any).Capacitor === 'undefined' || !(window as any).Capacitor.isPluginAvailable('App')) return;
-    
-    const listenerPromise = CapacitorApp.addListener('backButton', () => {
-      if (isHistoryOpen) { setIsHistoryOpen(false); return; }
-      if (isBookmarkOpen) { setIsBookmarkOpen(false); return; }
-      if (isHadithBookmarkOpen) { setIsHadithBookmarkOpen(false); return; }
-      
-      if (window.location.hash !== '' && window.location.hash !== '#home') {
-        window.history.back();
-      } else {
-        CapacitorApp.exitApp();
-      }
-    });
-    
-    return () => { listenerPromise.then(l => l.remove()); };
+    if (typeof (window as any).Capacitor?.isPluginAvailable('App')) {
+      const listenerPromise = CapacitorApp.addListener('backButton', () => {
+        if (isHistoryOpen || isBookmarkOpen || isHadithBookmarkOpen) {
+          setIsHistoryOpen(false); setIsBookmarkOpen(false); setIsHadithBookmarkOpen(false); return;
+        }
+        if (window.location.hash !== '' && window.location.hash !== '#home') {
+          window.history.back();
+        } else {
+          CapacitorApp.exitApp();
+        }
+      });
+      return () => { listenerPromise.then(l => l.remove()); };
+    }
   }, [isHistoryOpen, isBookmarkOpen, isHadithBookmarkOpen]);
 
   const handleHistorySelect = (item: HistoryItem) => {
@@ -180,77 +251,55 @@ const AppCore: React.FC = () => {
     navigate('RESULT');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
+
+  const handlePublicAnalysisSelect = (analysis: any) => {
+    setResult(analysis.full_result);
+    setError(null);
+    navigate('RESULT');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
   
-  const handleBookmarkSelect = (surah: number, ayah: number) => {
-    setBookmarkTarget({ surah, ayah });
-    setIsBookmarkOpen(false);
-    navigate('QURAN');
-  };
-
-  const handleHadithBookmarkSelect = (bookId: string, hadithNumber: number) => {
-    setHadithBookmarkTarget({ bookId, hadithNumber });
-    setIsHadithBookmarkOpen(false);
-    navigate('HADITH');
-  };
-
+  const handleBookmarkSelect = (surah: number, ayah: number) => { setBookmarkTarget({ surah, ayah }); setIsBookmarkOpen(false); navigate('QURAN'); };
+  const handleHadithBookmarkSelect = (bookId: string, hadithNumber: number) => { setHadithBookmarkTarget({ bookId, hadithNumber }); setIsHadithBookmarkOpen(false); navigate('HADITH'); };
+  
   const handleDeleteHistory = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setHistory((prev: HistoryItem[]) => prev.filter(item => item.id !== id));
+    deleteHistoryItem(id);
   };
-
-  const handleClearAllHistory = () => {
-    if (confirm('Hapus semua riwayat?')) setHistory([]);
-  };
+  
+  const handleClearAllHistory = () => clearAllHistory();
 
   const handleAnalyze = async (text: string, image: string | undefined) => {
-    setIsLoading(true);
-    setError(null);
-    setResult(null);
-    setInitialInputText(text);
-    
+    setIsLoading(true); setError(null); setResult(null); setInitialInputText(text);
     try {
       const data = await analyzeKitabText(text, image);
       setResult(data);
-      addToHistory(data);
+      await addToHistory(data);
       navigate('RESULT');
     } catch (err: any) {
-      console.error("Analysis Error:", err);
-      const errorMessage = err.message || 'Gagal memproses';
-      // Check for common API key / quota issues from the backend's forwarded error message
-      if (errorMessage.toLowerCase().includes('quota') || errorMessage.includes('429') || errorMessage.toLowerCase().includes('api key not valid')) {
-        setError("QUOTA_EXCEEDED");
-      } else {
-        setError(`Terjadi kesalahan: ${errorMessage}`);
-      }
+      const msg = err.message || 'Gagal memproses';
+      if (msg.toLowerCase().includes('quota') || msg.includes('429')) setError("QUOTA_EXCEEDED");
+      else setError(`Terjadi kesalahan: ${msg}`);
       navigate('HOME'); 
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleAnalyzeFromLibrary = async (text: string) => {
-    setInitialInputText(text);
-    await handleAnalyze(text, undefined);
-  };
-  
-  const handleBackToHome = () => {
-    setResult(null);
-    setInitialInputText('');
-    navigate('HOME');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
+  const handleAnalyzeFromLibrary = async (text: string) => { setInitialInputText(text); await handleAnalyze(text, undefined); };
+  const handleBackToHome = () => { setResult(null); setInitialInputText(''); navigate('HOME'); window.scrollTo({ top: 0, behavior: 'smooth' }); };
 
   const renderContent = () => {
     if (isLoading) return <LoadingIndicator />;
-
     switch(currentView) {
       case 'SETTINGS': return <SettingsView onHistoryClick={() => setIsHistoryOpen(true)} onBookmarksClick={() => setIsBookmarkOpen(true)} onHadithBookmarksClick={() => setIsHadithBookmarkOpen(true)} />;
+      case 'AUTH': return <AuthView onBack={() => navigate('SETTINGS')} />;
       case 'QURAN': return <ScriptureView type="QURAN" onSelect={(t) => handleAnalyze(t, undefined)} initialJump={bookmarkTarget} onOpenBookmarks={() => setIsBookmarkOpen(true)} />;
       case 'HADITH': return <ScriptureView type="HADITH" onSelect={(t) => handleAnalyze(t, undefined)} initialHadithJump={hadithBookmarkTarget} />;
       case 'LIBRARY_VIEW': return <LibraryView onAnalyzeText={handleAnalyzeFromLibrary} initialQuery={route.params.book} onBack={handleBackToHome} onOpenAuthor={(name) => navigate('AUTHOR_DETAIL', {name})} />;
       case 'BOOK_DETAIL': return <BookDetailPage title={route.params.title} author={route.params.author} onBack={() => window.history.back()} onOpenAuthor={(name) => navigate('AUTHOR_DETAIL', {name})} />;
       case 'AUTHOR_DETAIL': return <AuthorDetailPage authorName={route.params.name} onBack={() => window.history.back()} onOpenAuthor={(name) => navigate('AUTHOR_DETAIL', {name})} onOpenBook={(title) => navigate('LIBRARY_VIEW', {book: title})} />;
-      case 'RESULT': return result ? <main className="max-w-5xl mx-auto px-4 pt-8 mb-20 animate-fade-in"><ResultDisplay result={result} onOpenBookTOC={(title, author) => navigate('LIBRARY_VIEW', {book: title})} onBack={handleBackToHome} /></main> : null;
+      case 'RESULT': return result ? <main className="max-w-5xl mx-auto px-4 pt-8 mb-20 animate-fade-in"><ResultDisplay result={result} onOpenBookTOC={(title) => navigate('LIBRARY_VIEW', {book: title})} onBack={handleBackToHome} /></main> : null;
       case 'INHERITANCE': return <InheritanceView onBack={handleBackToHome} onAnalyze={(t) => handleAnalyze(t, undefined)} isLoading={isLoading} />;
       case 'ZAKAT': return <ZakatView onBack={handleBackToHome} />;
       case 'TASBIH': return <TasbihView onBack={handleBackToHome} />;
@@ -260,13 +309,12 @@ const AppCore: React.FC = () => {
       case 'QIBLA': return <QiblaView onBack={handleBackToHome} />;
       case 'READING_PRACTICE': return <ReadingPracticeView onBack={handleBackToHome} />;
       case 'QUIZ': return <QuizView onBack={handleBackToHome} />;
-      
       case 'HOME':
       default:
         return (
           <main className="max-w-5xl mx-auto px-4 py-6 md:py-10 flex flex-col items-center pb-24">
             <div className="w-full relative z-10">
-              <InputSection onAnalyze={handleAnalyze} onBookSelect={(title) => navigate('LIBRARY_VIEW', {book: title})} isAnalyzing={isLoading} initialValue={initialInputText} onHistoryClick={() => setIsHistoryOpen(true)} onOpenTool={(id) => navigate(id as ViewState)} />
+              <InputSection onAnalyze={handleAnalyze} onBookSelect={(title) => navigate('LIBRARY_VIEW', {book: title})} isAnalyzing={isLoading} initialValue={initialInputText} onHistoryClick={() => setIsHistoryOpen(true)} onOpenTool={(id) => navigate(id as ViewState)} onSelectPublicAnalysis={handlePublicAnalysisSelect} />
               {error && (
                 <div className="mt-6 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-4 flex items-start gap-3 text-red-700 dark:text-red-300 animate-pulse shadow-sm mx-auto max-w-2xl">
                   {error === "QUOTA_EXCEEDED" ? <AlertOctagon className="w-5 h-5 shrink-0 mt-0.5" /> : <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />}
