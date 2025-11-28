@@ -1,0 +1,14 @@
+{
+  "functions": {
+    "api/analyze.ts": {
+      "memory": 1024,
+      "maxDuration": 45
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/geocode",
+      "destination": "https://nominatim.openstreetmap.org/reverse"
+    }
+  ]
+}
