@@ -1,0 +1,9 @@
+{
+  "name": "Kitab Kuning AI",
+  "description": "Aplikasi penerjemah dan asisten belajar Kitab Kuning berbasis AI. Mendukung terjemahan standar, makna gandul (pesantren), dan analisis gramatika Nahwu/Shorof.",
+  "requestFramePermissions": [
+    "geolocation",
+    "camera",
+    "microphone"
+  ]
+}

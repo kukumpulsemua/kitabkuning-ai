@@ -1,0 +1,14 @@
+{
+  "appId": "id.bedahkitab.app",
+  "appName": "Kitab Kuning AI",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": true
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
