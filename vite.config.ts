@@ -1,14 +1,19 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // https://vitejs.dev/config/
-export default defineConfig({
-  plugins: [react()],
-  // The 'define' block for API_KEY has been removed for security.
-  // The key is now exclusively handled by the backend proxy.
-  base: './', // Ubah dari '/' ke './' agar aset dimuat relative (wajib untuk Capacitor/Android)
-  build: {
-    outDir: 'dist',
-    emptyOutDir: true,
-  },
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '');
+  return {
+    plugins: [react()],
+    define: {
+      'process.env.VITE_SUPABASE_URL': JSON.stringify(env.VITE_SUPABASE_URL),
+      'process.env.VITE_SUPABASE_ANON_KEY': JSON.stringify(env.VITE_SUPABASE_ANON_KEY),
+    },
+    base: './',
+    build: {
+      outDir: 'dist',
+      emptyOutDir: true,
+    },
+  }
 })
