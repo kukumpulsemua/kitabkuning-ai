@@ -1,9 +1,22 @@
 import { Type } from "@google/genai";
 import { TranslationResult, BookExplanation, AuthorExplanation, LibraryBookMetadata, ChapterContent, PracticeMaterial, QuizQuestion, EssayQuestion } from "../types.ts";
-import { generateCacheKey, getCache, setCache } from "./cacheService.ts";
+import * as supabaseService from './supabaseService.ts';
+
+// Helper: Simple Hash untuk membuat Key unik dari string panjang
+const generateHash = (str: string): string => {
+  let hash = 0;
+  if (str.length === 0) return hash.toString();
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash.toString();
+};
+
 
 // --- HELPER: BACKEND PROXY CALLER ---
-const generateContentFromBackend = async (payload: { model?: string; contents: any; config?: any; }) => {
+const generateContentFromBackend = async (payload: { model?: string; contents: any; config?: any; analysisType?: string; cacheId?: string; }) => {
     const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -33,13 +46,8 @@ const safeJsonParse = (jsonStr: string, fallbackValue: any = null) => {
   } catch (e) {
     console.warn("JSON Parse failed, attempting repair...", e);
     
+    // Simple repair logic (can be improved)
     let repaired = cleanStr.trim();
-    let quoteCount = 0;
-    for (let i = 0; i < repaired.length; i++) {
-      if (repaired[i] === '"' && (i === 0 || repaired[i-1] !== '\\')) quoteCount++;
-    }
-    if (quoteCount % 2 !== 0) repaired += '"';
-
     const stack = []; let inString = false;
     for (let i = 0; i < repaired.length; i++) {
       const char = repaired[i];
@@ -70,12 +78,9 @@ const extractTextFromResponse = (responseData: any): string => {
   if (!responseData) throw new Error("Menerima respons kosong dari AI.");
   if (responseData.candidates?.[0]?.finishReason === 'SAFETY') throw new Error("Konten diblokir oleh filter keamanan AI (Safety Filter).");
   
-  // The SDK's `GenerateContentResponse` object has a convenient `.text` getter.
-  // Our backend forwards the full response, so we can use this logic.
   const text = responseData.text;
   if (typeof text === 'string' && text.trim()) return text;
   
-  // Fallback for non-text or other structures
   const firstPartText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
   if (typeof firstPartText === 'string' && firstPartText.trim()) return firstPartText;
   
@@ -101,13 +106,6 @@ export const analyzeKitabText = async (
   text: string,
   imageBase64?: string
 ): Promise<TranslationResult> => {
-  const cacheKey = generateCacheKey('analysis', [text, imageBase64?.substring(0, 50) || '']);
-  const cachedResult = getCache<TranslationResult>(cacheKey);
-  if (cachedResult) return cachedResult;
-
-  const modelId = "gemini-2.5-flash";
-  const systemInstruction = `Anda adalah 'Allamah (Sangat Alim), Ahli Tahqiq (Peneliti Kitab), dan Pakar Bahasa Arab...`;
-
   const parts: any[] = [];
   if (imageBase64) {
     let mimeType = "image/jpeg"; let data = imageBase64;
@@ -118,16 +116,27 @@ export const analyzeKitabText = async (
   }
   if (text) parts.push({ text: `Analisis input ini: "${text}".` });
 
+  const contents = { parts };
+  const hash = generateHash(JSON.stringify(contents));
+  
+  // 1. Check public cache first
+  const cached = await supabaseService.getPublicAnalysis(hash);
+  if (cached) {
+      console.log("Public cache hit for analysis.");
+      return cached;
+  }
+
+  // 2. If not in cache, call AI via backend
   const payload = {
-    model: modelId,
-    contents: { parts: parts },
+    model: "gemini-2.5-flash",
+    contents,
     config: {
-      systemInstruction,
+      systemInstruction: `Anda adalah 'Allamah (Sangat Alim), Ahli Tahqiq (Peneliti Kitab), dan Pakar Bahasa Arab...`,
       responseMimeType: "application/json",
       responseSchema: translationSchema,
       temperature: 0.3,
-      maxOutputTokens: 30000,
-    }
+    },
+    analysisType: 'text_analysis'
   };
 
   const responseData = await generateContentFromBackend(payload);
@@ -135,32 +144,74 @@ export const analyzeKitabText = async (
   if (!cleanText) throw new Error("Empty response text from AI.");
 
   const result = safeJsonParse(cleanText) as TranslationResult;
-  setCache(cacheKey, result);
-  return result;
+  return result; // The backend now handles saving to public cache
 };
 
-// --- OTHER FUNCTIONS (Refactored to use backend proxy) ---
+// --- LIBRARY & BIO FUNCTIONS (WITH PUBLIC CACHING) ---
+export const getBookTableOfContents = async (bookTitle: string): Promise<LibraryBookMetadata> => {
+    const bookId = bookTitle.toLowerCase().replace(/ /g, '_').replace(/[^\w-]/g, '');
+    
+    // 1. Check public cache
+    const cached = await supabaseService.getPublicBookMetadata(bookId);
+    if (cached) {
+        console.log("Public cache hit for book metadata:", bookTitle);
+        return cached;
+    }
+
+    // 2. Call AI via backend
+    const payload = {
+        model: "gemini-2.5-flash",
+        contents: { parts: [{ text: `Buatkan Metadata lengkap untuk kitab: "${bookTitle}" dalam Bahasa Indonesia... JSON output.` }] },
+        config: { responseMimeType: "application/json", responseSchema: libraryBookSchema },
+        analysisType: 'book_metadata',
+        cacheId: bookId
+    };
+
+    const responseData = await generateContentFromBackend(payload);
+    const text = extractTextFromResponse(responseData);
+    return safeJsonParse(text) as LibraryBookMetadata;
+};
+
+export const explainAuthor = async (authorName: string): Promise<AuthorExplanation> => {
+    const authorId = authorName.toLowerCase().replace(/ /g, '_').replace(/[^\w-]/g, '');
+    
+    // 1. Check public cache
+    const cached = await supabaseService.getPublicAuthorBio(authorId);
+    if (cached) {
+        console.log("Public cache hit for author bio:", authorName);
+        return cached;
+    }
+
+    // 2. Call AI via backend
+    const payload = {
+        model: "gemini-2.5-flash",
+        contents: { parts: [{ text: `Buatkan biografi ulama: "${authorName}"... JSON Output.` }] },
+        config: { responseMimeType: "application/json", responseSchema: authorExplanationSchema },
+        analysisType: 'author_bio',
+        cacheId: authorId
+    };
+    
+    const responseData = await generateContentFromBackend(payload);
+    const text = extractTextFromResponse(responseData);
+    return safeJsonParse(text) as AuthorExplanation;
+};
+
+// --- NON-CACHED FUNCTIONS (QUIZZES, ETC) ---
+// These don't need public caching as they should be unique each time.
 
 export const generateReadingPractice = async (): Promise<PracticeMaterial> => {
-  const modelId = "gemini-2.5-flash";
   const topics = ["Thaharah", "Shalat", "Zakat", "Puasa", "Haji", "Jual Beli", "Nikah", "Jinayat"];
   const randomTopic = topics[Math.floor(Math.random() * topics.length)];
   const prompt = `Anda adalah seorang Ustadz... Buatkan satu materi latihan singkat... topik: "${randomTopic}".`;
 
   const payload = {
-    model: modelId,
+    model: "gemini-2.5-flash",
     contents: { parts: [{ text: prompt }] },
-    config: { 
-      responseMimeType: "application/json", 
-      responseSchema: practiceMaterialSchema, 
-      maxOutputTokens: 5000,
-      temperature: 0.5
-    }
+    config: { responseMimeType: "application/json", responseSchema: practiceMaterialSchema }
   };
 
   const responseData = await generateContentFromBackend(payload);
   const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
   return safeJsonParse(text) as PracticeMaterial;
 };
 
@@ -168,11 +219,10 @@ export const generateQuizQuestion = async (topic: string, difficulty: string): P
   const payload = {
     model: "gemini-2.5-flash",
     contents: { parts: [{ text: `Buatkan soal kuis Pilihan Ganda topik "${topic}" tingkat "${difficulty}". JSON: question, options, correctIndex, explanation.` }] },
-    config: { responseMimeType: "application/json", responseSchema: quizQuestionSchema, maxOutputTokens: 2000 }
+    config: { responseMimeType: "application/json", responseSchema: quizQuestionSchema }
   };
   const responseData = await generateContentFromBackend(payload);
   const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
   return safeJsonParse(text) as QuizQuestion;
 };
 
@@ -180,129 +230,32 @@ export const generateEssayQuestion = async (topic: string, difficulty: string): 
   const payload = {
     model: "gemini-2.5-flash",
     contents: { parts: [{ text: `Buatkan soal ESAI/Tantangan topik "${topic}" tingkat "${difficulty}". JSON output.` }] },
-    config: { responseMimeType: "application/json", responseSchema: essayQuestionSchema, maxOutputTokens: 3000 }
+    config: { responseMimeType: "application/json", responseSchema: essayQuestionSchema }
   };
   const responseData = await generateContentFromBackend(payload);
   const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
   return safeJsonParse(text) as EssayQuestion;
 };
 
-export const getBookTableOfContents = async (bookTitle: string): Promise<LibraryBookMetadata> => {
-  const cacheKey = generateCacheKey('library_toc', [bookTitle]);
-  const cached = getCache<LibraryBookMetadata>(cacheKey);
-  if (cached) return cached;
-  
-  const payload = {
-    model: "gemini-2.5-flash",
-    contents: { parts: [{ text: `Buatkan Metadata lengkap untuk kitab: "${bookTitle}" dalam Bahasa Indonesia... JSON output.` }] },
-    config: { responseMimeType: "application/json", responseSchema: libraryBookSchema, maxOutputTokens: 15000 }
-  };
-
-  const responseData = await generateContentFromBackend(payload);
-  const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
-  const result = safeJsonParse(text) as LibraryBookMetadata;
-  setCache(cacheKey, result);
-  return result;
-};
-
-export const getChapterContent = async (bookTitle: string, chapterTitle: string): Promise<ChapterContent> => {
-  const cacheKey = generateCacheKey('library_chapter', [bookTitle, chapterTitle]);
-  const cached = getCache<ChapterContent>(cacheKey);
-  if (cached) return cached;
-
-  const payload = {
-    model: "gemini-2.5-flash",
-    contents: { parts: [{ text: `Untuk KITAB: "${bookTitle}", BAB: "${chapterTitle}", berikan: 1. Teks Arab... JSON.` }] },
-    config: { responseMimeType: "application/json", responseSchema: chapterContentSchema, maxOutputTokens: 30000 }
-  };
-  
-  const responseData = await generateContentFromBackend(payload);
-  const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
-  const fallback: ChapterContent = { chapterTitle, arabicContent: "Gagal memuat teks.", translation: "Terjemahan tidak tersedia.", keyPoints: [] };
-  const result = safeJsonParse(text, fallback) as ChapterContent;
-  setCache(cacheKey, result);
-  return result;
-};
-
-export const explainBook = async (title: string, author?: string): Promise<BookExplanation> => {
-  const cacheKey = generateCacheKey('book', [title, author || '']);
-  const cached = getCache<BookExplanation>(cacheKey);
-  if (cached) return cached;
-  
-  const payload = {
-    model: "gemini-2.5-flash",
-    contents: { parts: [{ text: `Jelaskan profil kitab: "${title}"... JSON Output.` }] },
-    config: { responseMimeType: "application/json", responseSchema: bookExplanationSchema, maxOutputTokens: 15000 }
-  };
-
-  const responseData = await generateContentFromBackend(payload);
-  const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
-  const result = safeJsonParse(text) as BookExplanation;
-  setCache(cacheKey, result);
-  return result;
-};
-
-export const explainAuthor = async (authorName: string): Promise<AuthorExplanation> => {
-  const cacheKey = generateCacheKey('author', [authorName]);
-  const cached = getCache<AuthorExplanation>(cacheKey);
-  if (cached) return cached;
-
-  const payload = {
-    model: "gemini-2.5-flash",
-    contents: { parts: [{ text: `Buatkan biografi ulama: "${authorName}"... JSON Output.` }] },
-    config: { responseMimeType: "application/json", responseSchema: authorExplanationSchema, maxOutputTokens: 15000 }
-  };
-  
-  const responseData = await generateContentFromBackend(payload);
-  const text = extractTextFromResponse(responseData);
-  if(!text) throw new Error("Empty AI response");
-  const result = safeJsonParse(text) as AuthorExplanation;
-  setCache(cacheKey, result);
-  return result;
-};
-
-export const explainSpecificTopic = async (bookTitle: string, topic: string): Promise<string> => {
-  const cacheKey = generateCacheKey('topic', [bookTitle, topic]);
-  const cached = getCache<string>(cacheKey);
-  if (cached) return cached;
-
-  const payload = {
-    model: "gemini-2.5-flash",
-    contents: { parts: [{ text: `Jelaskan topik "${topic}" dari perspektif kitab "${bookTitle}" dalam Bahasa Indonesia. Format jawaban sebagai Markdown.` }] }
-  };
-
-  const responseData = await generateContentFromBackend(payload);
-  const text = extractTextFromResponse(responseData);
-  if (text) { setCache(cacheKey, text); return text; }
-  return "Gagal memuat topik.";
-};
-
-export const evaluateReadingAnswer = async (
-  userAnswer: string,
-  correctArabic: string,
-  correctTranslation: string
-): Promise<{ isCorrect: boolean; feedback: string }> => {
-  const schema = {
-    type: Type.OBJECT,
-    properties: {
-      isCorrect: { type: Type.BOOLEAN },
-      feedback: { type: Type.STRING }
-    },
-    required: ["isCorrect", "feedback"]
-  };
-
+export const evaluateReadingAnswer = async ( userAnswer: string, correctArabic: string, correctTranslation: string ): Promise<{ isCorrect: boolean; feedback: string }> => {
+  const schema = { type: Type.OBJECT, properties: { isCorrect: { type: Type.BOOLEAN }, feedback: { type: Type.STRING } }, required: ["isCorrect", "feedback"] };
   const payload = {
     model: "gemini-2.5-flash",
     contents: { parts: [{ text: `Anda adalah Ustadz... Kunci Jawaban... Jawaban Santri: "${userAnswer}"... Evaluasi... JSON: { "isCorrect": boolean, "feedback": string }` }] },
     config: { responseMimeType: "application/json", responseSchema: schema, temperature: 0.2 }
   };
-  
   const responseData = await generateContentFromBackend(payload);
   const text = extractTextFromResponse(responseData);
-  if (!text) throw new Error("Empty AI response for evaluation.");
   return safeJsonParse(text) as { isCorrect: boolean; feedback: string };
+};
+
+// Deprecated functions that are no longer needed with the public cache system
+export const getChapterContent = async (bookTitle: string, chapterTitle: string): Promise<ChapterContent> => {
+  throw new Error("getChapterContent is deprecated. Use local JSON files or a public database.");
+};
+export const explainBook = async (title: string, author?: string): Promise<BookExplanation> => {
+  throw new Error("explainBook is deprecated. Use public database cache.");
+};
+export const explainSpecificTopic = async (bookTitle: string, topic: string): Promise<string> => {
+   throw new Error("explainSpecificTopic is deprecated.");
 };
