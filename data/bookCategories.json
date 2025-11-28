@@ -1,0 +1,19 @@
+
+{
+  "Nahwu & Shorof": [
+    { "id": "jurumiyah", "title": "Matan Al-Jurumiyah", "author": "Syekh Ash-Shanhaji" }
+  ],
+  "Fiqih (Mazhab Syafi'i)": [
+    { "id": "safinah", "title": "Safinatun Najah", "author": "Syekh Salim bin Sumair" },
+    { "id": "fathul_qorib", "title": "Fathul Qorib", "author": "Syekh Ibnu Qosim Al-Ghazzi" }
+  ],
+  "Aqidah": [
+    { "id": "aqidatul_awam", "title": "Aqidatul Awam", "author": "Syekh Ahmad Al-Marzuqi" }
+  ],
+  "Hadits": [
+    { "id": "arbain_nawawi", "title": "Hadits Arba'in Nawawi", "author": "Imam An-Nawawi" }
+  ],
+  "Akhlak & Tasawuf": [
+    { "id": "talim_mutaallim", "title": "Ta'lim Muta'allim", "author": "Syekh Az-Zarnuji" }
+  ]
+}
